@@ -1,0 +1,1661 @@
+---
+title: "Final Working Model A-R-C Baseball Softball Scheduling"
+author: "Ye Yint Win, Dr. Nathan Axvig, Riley Fiske & Isaac Wayne"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(readxl)
+library(tidyverse)
+library(dplyr)
+library(lpSolve)
+library(lpSolveAPI)
+library(pracma)
+library(stringr)
+
+# Define Helper Functions: Thanks Dr. Nathan Axvig
+
+# Finds and eliminates all-zero rows from constraint matrix, and corresponding vectors
+# of inequalities and right hand side vector.  Returns cleaned up versions of all three.
+# NOTE:  the <<- assigns a value to a global variable declared outside the scope of the function
+# Contrast this with <- or =, which deal with local variables only in R.
+cleanUpModel = function()
+{
+  whereIsZero <- which(abs(constraintMatrix) %*% matrix(1,ncol(constraintMatrix),1) == 0)
+  if(length(whereIsZero) > 0)
+  {
+    constraintMatrix <<- constraintMatrix[-whereIsZero, ]
+    inequalities <<- inequalities[-whereIsZero, ,drop=FALSE]
+    rightHandSide <<- rightHandSide[-whereIsZero, ,drop=FALSE]
+  }
+}
+
+# for debugging only.  eliminates all-zero columns from a constraint matrix
+cleanUpModelColumns = function()
+{
+  whereIsZero <- which(matrix(nrow = 1, ncol = nrow(constraintMatrix),1)%*%abs(constraintMatrix)  == 0)
+  if(length(whereIsZero) > 0)
+  {
+    constraintMatrix <<- constraintMatrix[,-whereIsZero]
+    inequalities <<- inequalities[,-whereIsZero ,drop=FALSE]
+    rightHandSide <<- rightHandSide[,-whereIsZero ,drop=FALSE]
+    namesOfVariables <<- namesOfVariables[-whereIsZero]
+  }
+}
+
+# pads the model with all-zeros (or "") in preparation for adding vectors
+# this significantly speeds up the construction of the model by pre-allocating space
+# as opposed to massive copy/paste operations that R uses when you bind rows to a 
+# matrix one at a time.
+padModel = function(numberOfRowsToAdd)
+{
+  oldNumberOfConstraints <- nrow(constraintMatrix)
+  constraintMatrix <<- rbind(constraintMatrix,matrix(0,numberOfRowsToAdd,ncol(constraintMatrix)))
+  inequalities <<- rbind(inequalities,matrix("",numberOfRowsToAdd,1))
+  rightHandSide <<- rbind(rightHandSide,matrix(0,numberOfRowsToAdd,1))
+  nrc <- oldNumberOfConstraints + 1
+  return(nrc)
+}
+
+# generates a new constraint, ineq, rhs, and returns it
+# takes in an arbitrary length list of regular expressions and values, one of "=", "<=", and ">=", and a value for rhs
+generateConstraint = function(regexList,valueList,ineq,rhs)
+{
+  newConstraint <- matrix(0,1,length(namesOfVariables))
+  colnames(newConstraint) <- namesOfVariables
+  for(ii in 1:length(regexList))
+  {
+    regex <- regexList[ii]
+    indicesToModify <- grep(pattern = regex,namesOfVariables)
+    newConstraint[indicesToModify] <- valueList[ii]
+  }
+  constraintMatrix[newRowCounter,] <<- newConstraint
+  inequalities[newRowCounter,1] <<- ineq
+  rightHandSide[newRowCounter,1] <<- rhs
+  newRowCounter <<- newRowCounter + 1
+}
+
+```
+
+## Setting Directory and Parameters
+
+```{r setwd, include=FALSE}
+
+# Set working directory (update as needed)
+setwd("path/to/your/data")  # <-- Replace with a relative path or let user customize
+
+# Define solver path (update as needed)
+coinor_directory <- Sys.getenv("COINOR_DIR", unset = "/usr/local/bin")  # Environment variable fallback
+coin_solution_file <- file.path(coinor_directory, "ARCSolution.txt")
+
+
+maxNodes = 100000 #This is for COIN-OR CBC, a beefier solver than LPSolve
+
+#number of consecutive series/dates limit
+NUM_HOME_GAMES_BASEBALL = 3
+NUM_HOME_GAMES_SOFTBALL = 3
+
+NUM_AWAY_GAMES_BASEBALL = 3
+
+#Number of Games total by each team
+MAX_HOME_GAMES_W = 13
+MIN_HOME_GAMES_W = 11
+
+MAX_AWAY_GAMES_W = 13
+MIN_AWAY_GAMES_W = 11
+
+
+#Objective function parameters
+reward_3=3
+reward_5= 5
+reward_10 = 10
+
+reward_non_turf = reward_5
+reward_long_distance = reward_10
+reward_local = reward_10
+reward_Dubuque =reward_3
+reward_Loras = reward_3
+reward_senior_2 = reward_3
+reward_alternate_from_last_year = reward_3
+```
+
+## Get the Excel Files in first to build the set of decision variables
+
+```{r excel_load}
+
+# List of Teams Import
+teams_turf = as.matrix(read_excel("ARC_DATA/ARC_Teams.xlsx"))
+namesOfTeams = teams_turf[,1] # list of all team names
+teamsTurfMatrix = matrix(as.numeric(teams_turf[,2:ncol(teams_turf)]),nrow = nrow(teams_turf),ncol = ncol(teams_turf) -1) # rows and cols are named instead of numeric with name column
+colnames(teamsTurfMatrix) = colnames(teams_turf)[2:ncol(teams_turf)]
+rownames(teamsTurfMatrix) = namesOfTeams
+
+# Extract list of Turf Schools
+turfTeams = as.data.frame(teamsTurfMatrix) %>% filter(Turf == 1)
+nonturfTeams = as.data.frame(teamsTurfMatrix) %>% filter(Turf == 0)
+namesOfTurfTeams = row.names(turfTeams)
+namesOfTurfTeamsListRegExp = paste0("(",paste(namesOfTurfTeams, collapse = "|"),")")
+namesOfNonTurfTeams = row.names(nonturfTeams)
+namesOfNonTurfTeamsListRegExp = paste0("(",paste(namesOfNonTurfTeams, collapse = "|"),")")
+
+# List of Series Import
+baseball_series = as.matrix(read_excel("ARC_DATA/ARC_Baseball_series_2026.xlsx"))
+namesOfBaseballSeries = baseball_series[,1]
+baseballSeriesMatrix = matrix(as.numeric(baseball_series[,3:ncol(baseball_series)]), nrow = nrow(baseball_series), ncol = ncol(baseball_series) -2)
+colnames(baseballSeriesMatrix) = colnames(baseball_series)[3:ncol(baseball_series)]
+rownames(baseballSeriesMatrix) = namesOfBaseballSeries
+namesOfBaseballDates = baseball_series[,2]# Getting the series dates
+
+#Baseball Series that are weekend or weekday
+baseballWeekendRegExp = paste0("(",paste(row.names(as.data.frame(baseballSeriesMatrix) %>% filter(Weekend == 1)),collapse = "|"),")")
+baseballWeekdayRegExp = paste0("(",paste(row.names(as.data.frame(baseballSeriesMatrix) %>% filter(Weekday == 1)),collapse = "|"),")")
+
+#Extract List of Baseball Dates
+baseball_dates = as.matrix(read_excel("ARC_DATA/ARC_Baseball_Dates_2026.xlsx"))
+namesOfBaseballDate = baseball_dates[,1]
+baseballDatesMatrix = matrix(as.numeric(baseball_dates[,3:ncol(baseball_dates)]), nrow = nrow(baseball_dates), ncol = ncol(baseball_dates) -2)
+colnames(baseballDatesMatrix) = colnames(baseball_dates)[3:ncol(baseball_dates)]
+rownames(baseballDatesMatrix) = namesOfBaseballDate
+namesOfBaseballDate = baseball_dates[,2]# Getting the series dates
+
+#Baseball Dates that are weekend or weekday
+baseballWeekdayDatesRegExp = paste0("(",paste(row.names(as.data.frame(baseballDatesMatrix) %>% filter(Weekday == 1)),collapse = "|"),")")
+Weekday = row.names(as.data.frame(baseballDatesMatrix) %>% filter(Weekday == 1))
+baseballWeekendDatesRegExp = paste0("(",paste(row.names(as.data.frame(baseballDatesMatrix) %>% filter(Weekend == 1)),collapse = "|"),")")
+Weekend = row.names(as.data.frame(baseballDatesMatrix) %>% filter(Weekend == 1))
+
+#Extract List of Softball Series
+softball_series = as.matrix(read_excel("ARC_DATA/ARC_Softball_Dates_2026.xlsx"))
+namesOfSoftballSeries = baseball_series[,1]
+softballSeriesMatrix = matrix(as.numeric(softball_series[,3:ncol(softball_series)]), nrow = nrow(softball_series), ncol = ncol(softball_series) -2)
+colnames(softballSeriesMatrix) = colnames(softball_series)[3:ncol(softball_series)]
+rownames(softballSeriesMatrix) = namesOfSoftballSeries
+namesOfSoftballDates = softball_series[,2] # Getting the series dates
+
+softballWeekendRegExp = paste0("(",paste(row.names(as.data.frame(softballSeriesMatrix) %>% filter(Weekend == 1)),collapse = "|"),")")
+softballWeekdayRegExp = paste0("(",paste(row.names(as.data.frame(softballSeriesMatrix) %>% filter(Weekday == 1)),collapse = "|"),")")
+
+namesOfSeries = namesOfBaseballSeries
+namesofDate = namesOfBaseballDate
+
+```
+
+## Get the Excel Files for additional constraints and format
+
+```{r excel_load_more}
+
+# Softball as Key for Weekday Conflicts with Baseball
+dateN <- baseball_dates[,1]  
+dates <- baseball_dates[,2]  
+series <- baseball_dates[,5]  
+
+# Create a mapping of Series to DateN
+seriesList <- split(dateN, series)
+seriesListRegExp <- sapply(seriesList, function(dates) paste0(paste(dates, collapse = "|")))
+seriesListRegExp <- matrix(seriesListRegExp, length(seriesListRegExp), 1)
+rownames(seriesListRegExp) <- unique(series)
+colnames(seriesListRegExp) <- "DateNRegExp"
+
+
+# Long Distance Teams Import
+longdistance_teams = as.matrix(read_excel("ARC_DATA/ARC_LongDistance_Teams.xlsx"))
+longDistanceMatrix = matrix(longdistance_teams[,2:ncol(longdistance_teams)],nrow = nrow(longdistance_teams),ncol = ncol(longdistance_teams) -1) # rows and cols are named instead of numeric with name column
+colnames(longDistanceMatrix) = colnames(longdistance_teams)[2:ncol(longdistance_teams)]
+rownames(longDistanceMatrix) = namesOfTeams
+longDistanceListRegExp = ifelse(is.na(longDistanceMatrix), "", paste0("(", gsub(",", "|", longDistanceMatrix), ")"))
+longDistanceListRegExp = gsub(" ","",longDistanceListRegExp) # remove the extra spaces
+longDistanceListRegExp = matrix(longDistanceListRegExp,length(longDistanceListRegExp),1) # make conflicts into a vector
+row.names(longDistanceListRegExp) = namesOfTeams # name the rows that have the conflicts
+
+# Local Teams Import
+local_teams = as.matrix(read_excel("ARC_DATA/ARC_Local_Teams.xlsx"))
+localMatrix = matrix(local_teams[,2:ncol(local_teams)],nrow = nrow(local_teams),ncol = ncol(local_teams) -1) # rows and cols are named instead of numeric with name column
+colnames(localMatrix) = colnames(local_teams)[2:ncol(local_teams)]
+rownames(localMatrix) = namesOfTeams
+localListRegExp = ifelse(is.na(localMatrix), "", paste0("(", gsub(",", "|", localMatrix), ")"))
+localListRegExp = gsub(" ","",localListRegExp) # remove the extra spaces
+localListRegExp = matrix(localListRegExp,length(localListRegExp),1) # make conflicts into a vector
+row.names(localListRegExp) = namesOfTeams # name the rows that have tshe conflicts
+
+#2025 Schedule
+#Getting Data from 2025 to be able to alternate as a soft constraint
+#Baseball
+old_schedule_baseball = as.matrix(read_excel("ARC_DATA/2025_Schedule.xlsx",sheet = "Baseball"))
+#Softball
+old_schedule_softball = as.matrix(read_excel("ARC_DATA/2025_Schedule.xlsx",sheet = "Softball"))
+
+```
+
+## Create the set of decision variables and the blank constraint matrix
+
+Let's first think about how many decision variables there should be:
+
+For Potential Series:
+
+-   2 sports
+-   9 teams
+-   8 other teams
+-   9 series
+-   2 orderings for baseball, 1 ordering for softball
+
+For Potential Byes:
+
+-   9 teams
+-   9 series
+-   2 Sports
+
+```{r build_constraint_matrx}
+
+namesOfVariables = c()#initialize an empty list
+
+#Creating x,z
+for(s in namesOfSeries)
+{
+  for(ind1 in 1:(length(namesOfTeams)-1))
+  {
+    for (ind2 in (ind1+1):length(namesOfTeams))
+    {
+        t1 = namesOfTeams[ind1]
+        t2 = namesOfTeams[ind2]
+        
+        newGameVariable = paste("z",t1,t2,s,sep = ".")
+        namesOfVariables = c(namesOfVariables,newGameVariable)
+      
+    }
+  }
+}
+
+#Creating x,z
+for(s in namesOfSeries)
+{
+  for(t1 in namesOfTeams)
+  {
+    for (t2 in namesOfTeams)
+    {
+      if(t1!= t2)
+      {
+        newGameVariable = paste("x",t1,t2,s,sep = ".")
+        namesOfVariables = c(namesOfVariables,newGameVariable)
+      }
+    }
+    #Creating Bye Variables
+    newByeVariable = paste("bb",t1,s,sep = ".")
+    namesOfVariables = c(namesOfVariables,newByeVariable)
+    newByeVariable = paste("sb",t1,s,sep = ".")
+    namesOfVariables = c(namesOfVariables,newByeVariable)
+  }
+}
+
+
+for(d in dateN)
+{
+  for(t1 in namesOfTeams)
+  {
+    for (t2 in namesOfTeams)
+    {
+      if(t1!= t2)
+      {
+        newGameVariable = paste("y",t1,t2,d,sep = ".")
+        namesOfVariables = c(namesOfVariables,newGameVariable)
+      }
+    }
+  }
+}
+
+for(d in dateN)
+{
+  for(t1 in namesOfTeams)
+  {
+    for (t2 in namesOfTeams)
+    {
+      if(t1!= t2)
+      {
+        newGameVariable = paste("w",t1,t2,d,sep = ".")
+        namesOfVariables = c(namesOfVariables,newGameVariable)
+      }
+    }
+  }
+}
+
+
+```
+
+```{r}
+#namesOfVariables
+length(namesOfVariables)
+
+# Construct the blank constraint matrix with the appropriate column names
+constraintMatrix = matrix(0,0,length(namesOfVariables))
+colnames(constraintMatrix) = namesOfVariables
+inequalities = matrix("",0,1) # to hold our inequalities attached to the constraint matrix for corresponding rows of the same index
+rightHandSide = matrix(0,0,1) # to hold our r.h.s attached to the constraint matrix for corresponding rows of the same index
+
+```
+
+# Constraints
+
+## 1. One Bye Constraint
+
+For each sport and for each team, that team gets exactly one bye per season.
+
+For Baseball, $$
+\forall\, t_1 \in T,\quad \sum_{s \in S} bb_{t_1,s} = 1
+$$
+
+For Softball, $$
+\forall\, t_1 \in T,\quad \sum_{s \in S} sb_{t_1,s} = 1
+$$
+
+```{r first_constraint}
+#Baseball
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams))
+
+
+  for(t1 in namesOfTeams){
+    newConstraint = matrix(0,1,length(namesOfVariables)) 
+    colnames(newConstraint) = namesOfVariables 
+    regexList = c(paste("^bb",t1,".*",sep="\\."))
+    valueList = c(1)
+    newIneq = "="
+    newRhs = 1
+    generateConstraint(regexList,valueList,newIneq,newRhs)
+  }
+cleanUpModel()
+
+
+#SoftBall
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams))
+
+  for(t1 in namesOfTeams){
+    newConstraint = matrix(0,1,length(namesOfVariables)) 
+    colnames(newConstraint) = namesOfVariables 
+    regexList = c(paste("^sb",t1,".*",sep="\\."))
+    valueList = c(1)
+    newIneq = "="
+    newRhs = 1
+    generateConstraint(regexList,valueList,newIneq,newRhs)
+  }
+cleanUpModel()
+```
+
+## 2. Each Other Once Constraint
+
+For each sport and for each team, they must play each other team exactly once across all series.
+
+Baseball
+
+$$
+\forall\, t_1 \in T,\forall\, t_2 \in T \setminus t_1,\quad \sum_{s \in S} z_{t_1,t_2,s} + z_{t_2,t_1,s}= 1
+$$
+
+Softball
+
+$$
+\forall\, t_1 \in T,\ \forall\, t_2 \in T \setminus t_1,\quad \sum_{s \in S} x_{t_1,t_2,s} + x_{t_2,t_1,s}= 1 
+$$
+
+```{r second_constraint}
+#Baseball
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams) * (length(namesOfTeams) - 1 ))
+
+
+  for(t1 in namesOfTeams){
+    for(t2 in namesOfTeams){
+      if(t1 != t2){
+        newConstraint = matrix(0,1,length(namesOfVariables))
+        colnames(newConstraint) = namesOfVariables
+        regexList = c(paste("^z",t1,t2,".*",sep = "\\."),
+                      paste("^z",t2,t1,".*",sep = "\\."))
+        valueList = c(1,
+                      1)
+        newIneq = "="
+        newRhs = 1
+        generateConstraint(regexList,valueList,newIneq,newRhs)
+      }
+    }
+  }
+
+cleanUpModel()
+#SoftBall
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams) * (length(namesOfTeams) - 1 ))
+
+
+  for(t1 in namesOfTeams){
+    for(t2 in namesOfTeams){
+      if(t1 != t2){
+        newConstraint = matrix(0,1,length(namesOfVariables))
+        colnames(newConstraint) = namesOfVariables
+        regexList = c(paste("^x",t1,t2,".*",sep = "\\."),
+                      paste("^x",t2,t1,".*",sep = "\\."))
+        valueList = c(1,
+                      1)
+        newIneq = "="
+        newRhs = 1
+        generateConstraint(regexList,valueList,newIneq,newRhs)
+      }
+    }
+  }
+
+cleanUpModel()
+```
+
+## 3. Home\Away\Bye Constraint
+
+For each sport and for each series, it must be either home, away, or a bye.
+
+Softball $$\forall\, t_1 \in T,\ \forall\,s \in S ,\quad \sum_{t_2 \in T \setminus t_1} x_{t_1,t_2,s} + x_{t_2,t_1,s}+sb_{t_1,s}= 1 $$
+
+BaseBall $$\forall\, t_1 \in T,\ \forall\,s \in S ,\quad \sum_{t_2 \in T \setminus t_1} z_{t_1,t_2,s} + z_{t_2,t_1,s}+bb_{t_1,s}= 1 $$
+
+```{r third_constraint}
+#Baseball
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams) * length(namesOfSeries))
+
+  for(t1 in namesOfTeams){
+    for(series in namesOfSeries){
+      newConstraint = matrix(0,1,length(namesOfVariables))
+      colnames(newConstraint) = namesOfVariables
+      regexList = c(paste("^bb",t1,series,sep = "\\."),
+                    paste("^z",t1,".*",series,sep = "\\."),
+                    paste("^z",".*",t1,series,sep = "\\."))
+      valueList = c(1,
+                    1,
+                    1)
+      newIneq = "="
+      newRhs = 1
+      generateConstraint(regexList,valueList,newIneq,newRhs)
+    }
+  }
+cleanUpModel()
+
+
+#softball
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams) * length(namesOfSeries))
+
+  for(t1 in namesOfTeams){ 
+    for(series in namesOfSeries){
+      newConstraint = matrix(0,1,length(namesOfVariables))
+      colnames(newConstraint) = namesOfVariables
+      regexList = c(paste("^sb",t1,series,sep = "\\."), 
+                    paste("^x",t1,".*",series,sep = "\\."),
+                    paste("^x",".*",t1,series,sep = "\\."))
+      valueList = c(1,
+                    1,
+                    1)
+      newIneq = "="
+      newRhs = 1
+      generateConstraint(regexList,valueList,newIneq,newRhs)
+    }
+  }
+
+
+cleanUpModel()
+```
+
+## 4. H.H.A.H Constraint
+
+For each sport and for each team, there may not be more than **3** consecutive home series/dates.
+
+
+
+Baseball 
+$$
+\forall\, t_1 \in T,\ \forall\, d \in D:\quad
+\sum_{\substack{s \in S \\ \text{date}(s) = d}} bb_{t_1, s}
++ \sum_{d' \in \{d, d+1, \dots, d+3\}} \sum_{t2 \in T \setminus t_1} y_{t_1,t_2, d'}
+\leq 3
+$$
+
+Softball 
+$$
+\forall\, t_1 \in T,\ \forall\, s \in S:\quad
+\sum_{s' \in \{s, s+1, \dots, s+3\}} \sum_{t2 \in T \setminus t_1}
+\left( x_{t_1,t_2, s'} + sb_{t_1, s'} \right) 
+\leq 3
+$$ 
+Series 3
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t2 \in T \setminus t_1}y_{t_1,t_2,d_2} +y_{t_1,t_2,d_4} + y_{t_1,t_2,d_6} + bb_{t_1,s_3} \leq 2
+$$ 
+Series 5 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t2 \in T \setminus t_1}y_{t_1,t_2,d_6} +y_{t_1,t_2,d_8} + y_{t_1,t_2,d_{10}} + bb_{t_1,s_5} \leq 2
+$$
+
+```{r constraint_four}
+#Baseball
+# at most 3 home games in a row.
+
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams) * (length(dateN)))
+
+for (t1 in namesOfTeams) {
+  for (dates in dateN) {
+    dateNumber = as.numeric(str_extract(string = dates, pattern = "\\d+"))
+
+    if (dateNumber <= 11 - NUM_HOME_GAMES_BASEBALL) {
+      newConstraint = matrix(0, 1, length(namesOfVariables))
+      colnames(newConstraint) = namesOfVariables
+
+      series_match <- row.names(seriesListRegExp)[grep(dates, seriesListRegExp, value = TRUE)]
+
+      regexList <- c()
+      valueList <- c()
+
+      for (s in series_match) {
+        regexList <- c(regexList, paste("^bb", t1,s, sep = "\\.")) 
+        valueList <- c(valueList, 1)
+      }
+
+      dateList = dateNumber:(dateNumber + NUM_HOME_GAMES_BASEBALL)
+      datesRegExp = paste0("Date (",paste(dateList, collapse = "|"),")$")
+      
+      regexList <- c(regexList, paste("^y", t1, ".*", datesRegExp, sep = "\\."))
+      valueList <- c(valueList, 1)
+
+      newIneq = "<="
+      newRhs = NUM_HOME_GAMES_BASEBALL
+      generateConstraint(regexList, valueList, newIneq, newRhs)
+    }
+  }
+}
+
+
+
+cleanUpModel()
+#softball
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams) * (length(namesOfSeries)- NUM_HOME_GAMES_SOFTBALL))
+
+  for(t1 in namesOfTeams){
+    for(series in namesOfSeries){
+      seriesNumber = as.numeric(str_extract(string = series, pattern = "\\d+"))
+
+      if(seriesNumber <= 9- NUM_HOME_GAMES_SOFTBALL){
+        newConstraint = matrix(0,1,length(namesOfVariables))
+        colnames(newConstraint) = namesOfVariables
+
+        seriesList = seriesNumber:(seriesNumber+ NUM_HOME_GAMES_SOFTBALL)
+        seriesRegExp = paste0 ("Series (",paste(seriesList, collapse = "|"),")$")
+
+
+        regexList = c(paste("^x",t1,".*",seriesRegExp,sep = "\\."),
+                      paste("^sb",t1,seriesRegExp,sep = "\\."))
+        valueList = c(1,
+                      1)
+        
+        
+        newIneq = "<="
+        newRhs = NUM_HOME_GAMES_SOFTBALL
+        generateConstraint(regexList,valueList,newIneq,newRhs)
+
+
+      }
+    }
+  }
+
+
+
+cleanUpModel()
+
+#Additional Bye
+#If a team has a bye on series 3, we make sure that it will met the limit of consecutive games played.
+#This is only for the consecutive home game limit of 3 and will need to change if a change is implemented.
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams) * (length(dateN)))
+
+  for(t1 in namesOfTeams){
+    for(dates in dateN){
+
+        newConstraint = matrix(0,1,length(namesOfVariables))
+        colnames(newConstraint) = namesOfVariables
+        regexList = c(paste("^y",t1,".*","Date 2",sep = "\\."),
+                      paste("^y",t1,".*","Date 4",sep = "\\."),
+                      paste("^y",t1,".*","Date 6",sep = "\\."),
+                      paste("^bb",t1,"Series 3",sep = "\\.")
+                      )
+        valueList = c(1,
+                      1,
+                      1,
+                      1)
+ 
+        newIneq = "<="
+        newRhs = 2
+        generateConstraint(regexList,valueList,newIneq,newRhs)
+      }
+    }
+
+
+cleanUpModel()
+
+#If a team has a bye on series 5, we make sure that it will met the limit of consecutive games played.
+#This is only for the consecutive home game limit of 3 and will need to change if a change is implemented.
+
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams) * (length(dateN)))
+
+  for(t1 in namesOfTeams){
+    for(dates in dateN){
+
+        newConstraint = matrix(0,1,length(namesOfVariables))
+        colnames(newConstraint) = namesOfVariables
+        regexList = c(paste("^y",t1,".*","Date 6",sep = "\\."),
+                      paste("^y",t1,".*","Date 8",sep = "\\."),
+                      paste("^y",t1,".*","Date 10",sep = "\\."),
+                      paste("^bb",t1,"Series 5",sep = "\\.")
+                      )
+        valueList = c(1,
+                      1,
+                      1,
+                      1)
+ 
+        newIneq = "<="
+        newRhs = 2
+        generateConstraint(regexList,valueList,newIneq,newRhs)
+
+
+      }
+    }
+
+
+cleanUpModel()
+```
+
+## 5. A.A.H.A Constraint
+
+For each sport and for each team, there may not be more than **3** consecutive away series.
+
+Baseball 
+$$
+\forall\, t_1 \in T,\ \forall\, d \in D:\quad
+\sum_{\substack{s \in S \\ \text{date}(s) = d}} bb_{t_1, s}
++ \sum_{d' \in \{d, d+1, \dots, d+3\}} \sum_{t2 \in T \setminus t_1} y_{t_2,t_1, d'}
+\leq 3
+$$
+
+Softball 
+$$
+\forall\, t_1 \in T,\ \forall\, s \in S:\quad
+\sum_{s' \in \{s, s+1, \dots, s+3\}} \sum_{t2 \in T \setminus t_1}
+\left( x_{t_2,t_1, s'} + sb_{t_1, s'} \right) 
+\leq 3
+$$ 
+Series 3 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t2 \in T \setminus t_1}y_{t_2,t_1,d_2} +y_{t_2,t_1,d_4} + y_{t_2,t_1,d_6} + bb_{t_1,s_3} \leq 2
+$$ 
+Series 5 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t2 \in T \setminus t_1}y_{t_2,t_1,d_6} +y_{t_2,t_1,d_8} + y_{t_2,t_1,d_{10}} + bb_{t_1,s_5} \leq 2
+$$
+
+```{r constraint_five}
+#Baseball
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams) * (length(dateN) ))
+
+for (t1 in namesOfTeams) {
+  for (dates in dateN) {
+    dateNumber = as.numeric(str_extract(string = dates, pattern = "\\d+"))
+
+    if (dateNumber <= 11 - NUM_AWAY_GAMES_BASEBALL) {
+      newConstraint = matrix(0, 1, length(namesOfVariables))
+      colnames(newConstraint) = namesOfVariables
+
+      series_match <- row.names(seriesListRegExp)[grep(dates, seriesListRegExp, value = TRUE)]
+
+      regexList <- c()
+      valueList <- c()
+
+      for (s in series_match) {
+        regexList <- c(regexList, paste("^bb", t1, s, sep = "\\.")) 
+        valueList <- c(valueList, 1)
+      }
+
+      dateList = dateNumber:(dateNumber + NUM_HOME_GAMES_BASEBALL)
+      datesRegExp = paste0("Date (",paste(dateList, collapse = "|"),")$")
+      
+      regexList <- c(regexList, paste("^y", ".*", t1, datesRegExp, sep = "\\."))
+      valueList <- c(valueList, 1)
+
+      newIneq = "<="
+      newRhs = NUM_AWAY_GAMES_BASEBALL
+      generateConstraint(regexList, valueList, newIneq, newRhs)
+    }
+  }
+}
+
+cleanUpModel()
+
+#Additional Bye
+#If the a team has a bye on series 3, we make sure that it will met the limit of consecutive games played.
+#This is only for the consecutive away game limit of 3 and will need to change if a change is implemented.
+
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams) * (length(dateN)))
+
+  for(t1 in namesOfTeams){
+    for(dates in dateN){
+
+        newConstraint = matrix(0,1,length(namesOfVariables))
+        colnames(newConstraint) = namesOfVariables
+        regexList = c(paste("^y",".*",t1,"Date 2",sep = "\\."),
+                      paste("^y",".*",t1,"Date 4",sep = "\\."),
+                      paste("^y",".*",t1,"Date 6",sep = "\\."),
+                      paste("^bb",t1,"Series 3",sep = "\\.")
+                      )
+        valueList = c(1,
+                      1,
+                      1,
+                      1)
+ 
+        newIneq = "<="
+        newRhs = 3
+        generateConstraint(regexList,valueList,newIneq,newRhs)
+
+
+      }
+    }
+
+
+cleanUpModel()
+
+#If the a team has a bye on series 3, we make sure that it will met the limit of consecutive games played.
+#This is only for the consecutive away game limit of 3 and will need to change if a change is implemented.
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams) * (length(dateN)))
+
+  for(t1 in namesOfTeams){
+    for(dates in dateN){
+
+        newConstraint = matrix(0,1,length(namesOfVariables))
+        colnames(newConstraint) = namesOfVariables
+        regexList = c(paste("^y",".*",t1,"Date 6",sep = "\\."),
+                      paste("^y",".*",t1,"Date 8",sep = "\\."),
+                      paste("^y",".*", t1,"Date 10",sep = "\\."),
+                      paste("^bb",t1,"Series 5",sep = "\\.")
+                      )
+        valueList = c(1,
+                      1,
+                      1,
+                      1)
+ 
+        newIneq = "<="
+        newRhs = 3
+        generateConstraint(regexList,valueList,newIneq,newRhs)
+
+
+      }
+    }
+
+
+cleanUpModel()
+```
+
+##6. BaseBall H/A Max Constraint 
+###W constraints
+
+
+This is only for baseball.
+W-variables was added to have a set of variables that can keep count of how the numbers of games a team played for each series, so that there a maximum limit for both home and away games played by each team.
+
+W-variables matching with baseball dates variables for Weekdays.
+$$
+\forall\, t_1 \in T,\forall\,t2 \in T \setminus t_1,\forall\,dd\in D_{weekday}:\quad
+w_{t_1,t_2,dd} \leq  2y_{t_1,t_2,dd} 
+$$
+
+W-variables matching with baseball dates variables for Weekends.
+$$
+\forall\, t_1 \in T,\forall\,t2 \in T \setminus t_1,\forall\,dd\in D_{weekend}:\quad
+w_{t_1,t_2,dd} = 3y_{t_1,t_2,dd}
+$$
+
+```{r}
+
+
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams)*length(namesOfTeams)*length(dateN))
+#This for-loop connects w-variables with the y-variables that have information on the Baseball series on the Weekday.
+for(t1 in namesOfTeams){
+
+ for(t2 in namesOfTeams){
+   for(dd in Weekday)
+   {
+     if(t1!= t2){
+       newConstraint = matrix(0,1,length(namesOfVariables))
+       colnames(newConstraint) = namesOfVariables
+  
+       regexList = c(paste("^w",t1,t2,dd,sep = "\\."),
+                   paste("^y",t1,t2,dd,sep = "\\.")
+                   )
+       valueList = c(1,
+                     -2
+                     )
+       newIneq = "<="
+       newRhs = 0
+       generateConstraint(regexList,valueList,newIneq,newRhs)
+     }
+ }
+ }
+}
+cleanUpModel()
+
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams)*length(namesOfTeams)*length(dateN))
+#This for-loop connects w-variables with the y-variables that have information on the Baseball series on the Weekend.
+for(t1 in namesOfTeams){
+
+ for(t2 in namesOfTeams){
+   for(dd in Weekend)
+   {
+   if(t1!= t2){
+     newConstraint = matrix(0,1,length(namesOfVariables))
+     colnames(newConstraint) = namesOfVariables
+
+     regexList = c(paste("^w",t1,t2,dd,sep = "\\."),
+                 paste("^y",t1,t2,dd,sep = "\\.")
+                 )
+     valueList = c(1,
+                   -3
+                   )
+     newIneq = "="
+     newRhs = 0
+     generateConstraint(regexList,valueList,newIneq,newRhs)
+   }
+   }
+ }
+}
+cleanUpModel()
+
+
+```
+
+### W split constraint
+This is to match W-variables of Series 3 and Series 6 of baseball series constraint as they are split series.
+
+W-variables for Series 3 of Baseball
+$$
+\forall\, t_1 \in T,\forall\,t2 \in T \setminus t_1:\quad
+w_{t_1,t_2,d_3} +w_{t_2,t_1,d_3}+w_{t_1,t_2,d_5}+w_{t_2,t_1,d_5}= 3z_{t_1,t_2,s_3}+ 3z_{t_2,t_1,s_3} 
+$$
+
+W-variables for Series 6 of Baseball
+$$
+\forall\, t_1 \in T,\forall\,t2 \in T \setminus t_1:\quad
+w_{t_1,t_2,d_7} +w_{t_2,t_1,d_7}+w_{t_1,t_2,d_9}+w_{t_2,t_1,d_9}= 3z_{t_1,t_2,s_6}+ 3z_{t_2,t_1,s_6} 
+$$
+
+```{r}
+newRowCounter = padModel(numberOfRowsToAdd =  length(namesOfTeams)*length(namesOfTeams))
+
+#We have to make sure that the w-variables also accounts for split series that happens on the Weekdays.
+for(t1 in namesOfTeams){
+  for(t2 in namesOfTeams){
+    if(t1 != t2){
+    newConstraint = matrix(0,1,length(namesOfVariables))
+    colnames(newConstraint) = namesOfVariables
+
+
+    regexList = c(paste("^w",t1,t2,"Date 3",sep = "\\."),
+                  paste("^w",t2,t1,"Date 3",sep = "\\."),
+                  paste("^w",t1,t2,"Date 5",sep = "\\."),
+                  paste("^w",t2,t1,"Date 5",sep = "\\."),
+                  paste("^z",t1,t2,"Series 3",sep = "\\."),
+                  paste("^z",t2,t1,"Series 3",sep = "\\.")
+                  )
+    valueList = c(1,
+                  1,
+                  1,
+                  1,
+                  -3,
+                  -3)
+    newIneq = "="
+    newRhs = 0
+    generateConstraint(regexList,valueList,newIneq,newRhs)
+
+    }
+  }
+}
+cleanUpModel()
+
+#3
+newRowCounter = padModel(numberOfRowsToAdd =  length(namesOfTeams)*length(namesOfTeams))
+
+for(t1 in namesOfTeams){
+  for(t2 in namesOfTeams){
+    if(t1 != t2){
+    newConstraint = matrix(0,1,length(namesOfVariables))
+    colnames(newConstraint) = namesOfVariables
+
+
+    regexList = c(paste("^w",t1,t2,"Date 7",sep = "\\."),
+                  paste("^w",t2,t1,"Date 7",sep = "\\."),
+                  paste("^w",t1,t2,"Date 9",sep = "\\."),
+                  paste("^w",t2,t1,"Date 9",sep = "\\."),
+                  paste("^z",t1,t2,"Series 6",sep = "\\."),
+                 paste("^z",t2,t1,"Series 6",sep = "\\.") )
+    valueList = c(1,
+                  1,
+                  1,
+                  1,
+                  -3,
+                  -3)
+    newIneq = "="
+    newRhs = 0
+    generateConstraint(regexList,valueList,newIneq,newRhs)
+
+    }
+  }
+}
+cleanUpModel()
+```
+
+### W MAx Dates
+As we used W-variables to keep count of dates that teams played. Here's we have constraints for how many dates a team should be playing.
+
+Max Game Home 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t_2\in T\setminus{t_1}}\sum_{d\in D} w_{t_1,t_2,d} \leq 13
+$$
+
+Min Games Home 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t_2\in T\setminus{t_1}}\sum_{d\in D} w_{t_1,t_2,d} \geq 11
+$$
+Max Game Away 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t_2\in T\setminus{t_1}}\sum_{d\in D} w_{t_2,t_1,d} \leq 13
+$$
+
+Min Games Away 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t_2\in T\setminus{t_1}}\sum_{d\in D} w_{t_2,t_1,d} \geq 11
+$$
+
+```{r}
+# home
+#To make sure that there a limit of how many home games a team has to play, w-constraints keeps track of it and limit them.
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams))
+   for(t1 in namesOfTeams){
+     newConstraint = matrix(0,1,length(namesOfVariables))
+     colnames(newConstraint) = namesOfVariables
+     regexList = c(paste("^w",t1,".*",".*",sep = "\\."))
+     valueList = c(1)
+     newIneq = "<="
+     newRhs = MAX_HOME_GAMES_W
+     generateConstraint(regexList,valueList,newIneq,newRhs)
+   }
+
+cleanUpModel()
+
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams))
+# home
+   for(t1 in namesOfTeams){
+     newConstraint = matrix(0,1,length(namesOfVariables))
+     colnames(newConstraint) = namesOfVariables
+     regexList = c(paste("^w",t1,".*",".*",sep = "\\."))
+     valueList = c(1)
+     newIneq = ">="
+     newRhs = MIN_HOME_GAMES_W
+     generateConstraint(regexList,valueList,newIneq,newRhs)
+   }
+
+cleanUpModel()
+
+
+#AWAY
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams))
+# away
+   for(t1 in namesOfTeams){
+     newConstraint = matrix(0,1,length(namesOfVariables))
+     colnames(newConstraint) = namesOfVariables
+     regexList = c(paste("^w",".*",t1,".*",sep = "\\."))
+     valueList = c(1)
+     newIneq = ">="
+     newRhs = MIN_AWAY_GAMES_W
+     generateConstraint(regexList,valueList,newIneq,newRhs)
+   }
+
+cleanUpModel()
+
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams))
+# away
+   for(t1 in namesOfTeams){
+     newConstraint = matrix(0,1,length(namesOfVariables))
+     colnames(newConstraint) = namesOfVariables
+     regexList = c(paste("^w",".*",t1,".*",sep = "\\."))
+     valueList = c(1)
+     newIneq = "<="
+     newRhs = MAX_AWAY_GAMES_W
+     generateConstraint(regexList,valueList,newIneq,newRhs)
+   }
+
+cleanUpModel()
+```
+
+## 7. Softball H/A Max Constraint
+
+Each Team per season gets 4 away series and 4 home series. 
+
+Max Game Away 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t_2\in T\setminus{t_1}}\sum_{s\in S} x_{t_1,t_2,s} = 4
+$$
+
+Min Games Away 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t_2\in T\setminus{t_1}}\sum_{s\in S} x_{t_2,t_1,s} = 4
+$$
+
+```{r}
+#THe loops below makes sure that there are a total of 4 Home series and 4 Away Series for each Softball Team.
+#Softball
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams) )
+# home
+   for(t1 in namesOfTeams){
+     newConstraint = matrix(0,1,length(namesOfVariables))
+     colnames(newConstraint) = namesOfVariables
+     regexList = c(paste("^x",t1,".*",".*",sep = "\\."))
+     valueList = c(1)
+     newIneq = "="
+     newRhs = 4
+     generateConstraint(regexList,valueList,newIneq,newRhs)
+   }
+cleanUpModel()
+
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams) )
+
+# away
+   for(t1 in namesOfTeams){
+     newConstraint = matrix(0,1,length(namesOfVariables))
+     colnames(newConstraint) = namesOfVariables
+
+
+     regexList = c(paste("^x",".*",t1,".*",sep = "\\."))
+     valueList = c(1)
+     newIneq = "="
+     newRhs = 4
+     generateConstraint(regexList,valueList,newIneq,newRhs)
+   }
+
+
+cleanUpModel()
+```
+
+## 8. Senior Weekend Constraint
+
+For each sport and for each team, they must have at least one home **weekend** series in one of the last **3** weekend series.
+
+Baseball Senior 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t_2\in T\setminus{t_1}}\sum_{d\in D_{8,10,11}} y_{t_1,t_2,d} \geq 1
+$$
+
+Softball Senior 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t_2\in T\setminus{t_1}}\sum_{s\in S_{5,7,9}} x_{t_1,t_2,s} \geq 1
+$$
+
+```{r constraint_six}
+MAX_SENIOR_WEND = 2
+
+#Baseball
+newRowCounter = padModel(numberOfRowsToAdd =  length(namesOfTeams))
+
+  for(t1 in namesOfTeams){
+    newConstraint = matrix(0,1,length(namesOfVariables))
+    colnames(newConstraint) = namesOfVariables
+
+    DateToFindRegex = "Date (8|10|11)$"
+    regexList = c(paste("^y",t1,".*",DateToFindRegex,sep = "\\."))
+    valueList = c(1)
+    newIneq = ">="
+    newRhs = 1
+    generateConstraint(regexList,valueList,newIneq,newRhs)
+    }
+
+
+cleanUpModel()
+
+#Softball
+newRowCounter = padModel(numberOfRowsToAdd =  length(namesOfTeams))
+
+  for(t1 in namesOfTeams){
+    newConstraint = matrix(0,1,length(namesOfVariables))
+    colnames(newConstraint) = namesOfVariables
+
+    SeriesToFindRegex = "Series (5|7|9)"
+
+    regexList = c(paste("^x",t1,".*",SeriesToFindRegex,sep = "\\."))
+    valueList = c(1)
+    newIneq = ">="
+    newRhs = 1
+    generateConstraint(regexList,valueList,newIneq,newRhs)
+  }
+
+cleanUpModel()
+
+
+```
+
+## 9. Alternate Constraint
+
+Alternate weekdays: For split weekdays, if a team play the first weekday of Series 3, they will play the second weekday of Series 3 against the same team but away.
+
+
+Series 3 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t_2\in T\setminus{t_1}} y_{t_1,t_2,d_3}+y_{t_2,t_1,d_5}+y_{t_2,t_1,d_3}+y_{t_1,t_2,d_5}+ 2bb_{t_1,s_3} = 2
+$$
+
+Series 6 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t_2\in T\setminus{t_1}} y_{t_1,t_2,d_7}+y_{t_2,t_1,d_9}+y_{t_2,t_1,d_7}+y_{t_1,t_2,d_9}+ 2bb_{t_1,s_6} = 2
+$$
+
+Series 3: No two Home Games for split series 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t_2\in T\setminus{t_1}} y_{t_1,t_2,d_3}+y_{t_1,t_2,d_5} \leq 1
+$$
+
+Series 6: No two Home Games for split series 
+$$
+\forall\, t_1 \in T:\quad
+\sum_{t_2\in T\setminus{t_1}} y_{t_1,t_2,d_7}+y_{t_1,t_2,d_9} \leq 1
+$$
+
+```{r constraint_eight}
+#Baseball
+#1
+newRowCounter = padModel(numberOfRowsToAdd =  length(namesOfTeams))
+#If a team plays on the weekday for Baseball, the loops below make sure that they are alternating with their corresponding dates.
+for(t1 in namesOfTeams){
+    newConstraint = matrix(0,1,length(namesOfVariables))
+    colnames(newConstraint) = namesOfVariables
+
+
+    regexList = c(paste("^y",t1,".*","Date 3",sep = "\\."),
+                  paste("^y",".*",t1,"Date 5",sep = "\\."),
+                  paste("^y",".*",t1,"Date 3",sep = "\\."),
+                  paste("^y",t1,".*","Date 5",sep = "\\."),
+                  paste("^bb",t1,"Series 3",sep = "\\."))
+    valueList = c(1,
+                  1,
+                  1,
+                  1,
+                  2)
+    newIneq = "="
+    newRhs = 2
+    generateConstraint(regexList,valueList,newIneq,newRhs)
+
+}
+cleanUpModel()
+
+#3
+newRowCounter = padModel(numberOfRowsToAdd =  length(namesOfTeams))
+
+for(t1 in namesOfTeams){
+    newConstraint = matrix(0,1,length(namesOfVariables))
+    colnames(newConstraint) = namesOfVariables
+
+
+    regexList = c(paste("^y",t1,".*","Date 7",sep = "\\."),
+                  paste("^y",".*",t1,"Date 9",sep = "\\."),
+                  paste("^y",".*",t1,"Date 7",sep = "\\."),
+                  paste("^y",t1,".*","Date 9",sep = "\\."),
+                  paste("^bb",t1,"Series 6",sep = "\\."))
+    valueList = c(1,
+                  1,
+                  1,
+                  1,
+                  2)
+    newIneq = "="
+    newRhs = 2
+    generateConstraint(regexList,valueList,newIneq,newRhs)
+
+}
+cleanUpModel()
+
+#Here, we make sure that they are not playing two home games for the dates in the split series.
+newRowCounter = padModel(numberOfRowsToAdd =  length(namesOfTeams))
+
+for(t1 in namesOfTeams){
+    newConstraint = matrix(0,1,length(namesOfVariables))
+    colnames(newConstraint) = namesOfVariables
+
+
+    regexList = c(paste("^y",t1,".*","Date 7",sep = "\\."),
+                  paste("^y",t1,".*","Date 9",sep = "\\."))
+    valueList = c(
+                  1,
+                  1
+                 )
+    newIneq = "<="
+    newRhs = 1
+    generateConstraint(regexList,valueList,newIneq,newRhs)
+
+}
+cleanUpModel()
+
+newRowCounter = padModel(numberOfRowsToAdd =  length(namesOfTeams))
+
+for(t1 in namesOfTeams){
+    newConstraint = matrix(0,1,length(namesOfVariables))
+    colnames(newConstraint) = namesOfVariables
+
+
+    regexList = c(paste("^y",t1,".*","Date 3",sep = "\\."),
+                  paste("^y",t1,".*","Date 5",sep = "\\."))
+    valueList = c(
+                  1,
+                  1
+                 )
+    newIneq = "<="
+    newRhs = 1
+    generateConstraint(regexList,valueList,newIneq,newRhs)
+
+}
+cleanUpModel()
+
+```
+
+##10. One per Date Constraint
+
+One game per Date for Baseball 
+$$
+\forall\, t_1 \in T, \forall\,d \in D:\quad
+\sum_{t_2\in T\setminus{t_1}} y_{t_1,t_2,d}+y_{t_2,t_1,d} \leq 1
+$$
+
+```{r}
+#Baseball
+newRowCounter = padModel(numberOfRowsToAdd = length(namesOfTeams) * length(dateN))
+#Here, we make sure that a team has only one match up for each dates for baseball.
+  for(t1 in namesOfTeams){
+    for(dates in dateN){
+      
+      dates = paste0(dates,"$")
+      newConstraint = matrix(0,1,length(namesOfVariables))
+      colnames(newConstraint) = namesOfVariables
+      regexList = c(
+                    paste("^y",t1,".*",dates,sep = "\\."),
+                    paste("^y",".*",t1,dates,sep = "\\."))
+      valueList = c(1,
+                    1
+                    )
+      newIneq = "<="
+      newRhs = 1
+      generateConstraint(regexList,valueList,newIneq,newRhs)
+    }
+  }
+
+
+cleanUpModel()
+```
+
+## 11. Linking z and y Constraint
+
+Linking z and y 
+$$
+\forall\, t_1\in T \setminus t_2,\ \forall\, s \in S \setminus \{s_3, s_6\}:\quad
+z_{t_1,t_2,s} + z_{t_2,t_1,s}
+= \sum_{d \in D_s} \left( y_{t_1,t_2,d} + y_{t_2,t_1,d} \right)
+$$
+
+$$
+\forall\, t_1\in T \setminus t_2,\ \forall\, s \in  \{s_3, s_6\}:\quad
+2z_{t_1,t_2,s} + 2z_{t_2,t_1,s}
+= \sum_{d \in D_s} \left( y_{t_1,t_2,d} + y_{t_2,t_1,d} \right)
+$$
+
+```{r constraint_fourteen}
+#z-variables are the variables with series for baseball, and y-variables are the one with dates for baseball.
+#The loops below makes sure that the z-variables with series are connected with their corresponding y-variables with dates for baseball.
+newRowCounter = padModel(numberOfRowsToAdd = (2 * length(namesOfTeams)) * length(seriesListRegExp)*length(seriesListRegExp))
+
+
+for (t1 in namesOfTeams) {
+  for (t2 in namesOfTeams) {
+    if (t1 != t2) {
+      for (s in row.names(seriesListRegExp)) {
+        if (s == "Series 3" || s == "Series 6") {
+          dates <- trimws(unlist(strsplit(seriesListRegExp[s,], split = "\\|")))
+          dates = paste0(dates,"$")
+          regexList <- c(paste("^z", t1, t2, s, sep = "\\."),paste("^z", t2, t1, s, sep = "\\.")) 
+          valueList <- c(2,2)
+
+          for (d in dates) {
+            regexList <- c(regexList, 
+                           paste("^y", t1, t2, d, sep = "\\."),
+                           paste("^y", t2, t1, d, sep = "\\.")) 
+            valueList <- c(valueList, -1, -1)
+          }
+
+          newIneq <- "="
+          newRhs <- 0
+          generateConstraint(regexList, valueList, newIneq, newRhs)
+        }
+        else {
+          dates <- trimws(unlist(strsplit(seriesListRegExp[s, "DateNRegExp"], split = "\\|")))
+          dates = paste0(dates,"$")
+          regexList <- c(paste("^z", t1, t2, s, sep = "\\."),paste("^z", t2, t1, s, sep = "\\."))
+          valueList <- c(1,1)
+
+          for (d in dates) {
+            regexList <- c(regexList,
+                           paste("^y", t1, t2, d, sep = "\\."),
+                           paste("^y", t2, t1, d, sep = "\\."))
+            valueList <- c(valueList, -1, -1)
+          }
+
+          newIneq <- "="
+          newRhs <- 0
+          generateConstraint(regexList, valueList, newIneq, newRhs)
+        }
+      }
+    }
+  }
+}
+
+cleanUpModel()
+```
+
+Since some of the. columnns are empty in this contraint Matrix, we clean up the ones without any values for the LPsolver to have a quicker and better solution.
+
+```{r}
+cleanUpModel()
+dim(constraintMatrix)
+cleanUpModelColumns()
+dim(constraintMatrix)
+```
+
+# COIN-OR CBC Solver
+
+Solve for a solution using COIN-OR CBC
+
+For our objective Function, we maximized soft constraints that we want to fulfill to optimize our solution. 
+We have 7 soft constraints:
+1. Non-Turf: we want to create as many teams without turf to play at home for the first series of the season.
+2. Long Dist: we want to create a match-up between teams that are long distance from each other to be on weekends.
+3. Local : we want to create a match-up between teams that are local to each other to be on weekdays.
+4. Dubuque: Dubuque University requested to have the only bye for the baseball team to be a weekend.
+5. Loras: Loras College requested to have a bye on Easter for both baseball and softball teams.
+6. Senior: we have a hard constraint of one of the last three weekends to be at home for seniors for every team. However, we were requested 2 weekends, but it makes our objective function infeasible for our model. Therefore, it became a soft constraint.
+7. Alternate Last Year: we wanted to have match ups from last year season to be alternated for this season.
+
+For Soft constraint, we used three levels of 'reward' (Not technical, it's just numbers to meet the conditions of some soft constraints more than the other): 
+reward_3 (low reward),reward_5 (middle reward, and reward_10(high reward).
+If a condition of the soft constraint is met, the variables we have will be multiplied by 3, 5, 10 by given rewards. Then, we will get the maximized optimal solution to our problem.
+
+```{r solve_coinorcbc}
+
+# Create LP object
+LP = make.lp(NROW(constraintMatrix),NCOL(constraintMatrix))
+set.type(LP,grep("^(x|y|z|bb|sb)",namesOfVariables),type=c("binary"))
+set.type(LP,grep("^(w)",namesOfVariables),type=c("int"))
+
+
+# Create objective function
+
+
+#The objective function of this model is a maximization of the reward system that consists of all the soft constraints.
+#The numbers 3, 5, 10 are from low, middle and high priority for each soft constraints. For example, constraints for long-distance and local teams are the most important so they got 10 for every time the schedule was able to fulfill it.
+
+objectiveFunction = matrix(0,1,length(namesOfVariables))
+colnames(objectiveFunction) = namesOfVariables
+
+
+#Long Distance
+dateToSearchWE = baseballWeekendDatesRegExp
+dateToSearchWE = paste0(dateToSearchWE,"$")
+
+#Local Teams
+dateToSearchWD = baseballWeekdayDatesRegExp
+dateToSearchWD = paste0(dateToSearchWD,"$")
+  
+count_total = 0
+
+#Non-turf
+for(t1 in namesOfNonTurfTeams){
+  regexList = c(paste("^y",t1,".*","Date 1$",sep = "\\."))
+  
+  for(regex in regexList)
+  {
+    objectiveFunction[1,grep(regex,namesOfVariables)] = reward_non_turf
+  }
+}
+
+for(t1 in namesOfTeams){
+    namesOfLongDistanceTeams = trimws(unlist(strsplit(longDistanceMatrix[t1,], split = "\\,")))
+
+    for(t2 in namesOfLongDistanceTeams){
+      if(!is.na(t2)){
+       
+        regexList = c(paste("^y",t1,t2,dateToSearchWE,sep = "\\."),
+                    paste("^y",t2,t1,dateToSearchWE,sep = "\\.")
+                    )
+        for(regex in regexList)
+        {
+          objectiveFunction[1,grep(regex,namesOfVariables)] = reward_long_distance
+        }
+      }
+  }
+}
+
+for(t1 in namesOfTeams){
+ namesOfLocalTeams = trimws(unlist(strsplit(localMatrix[t1,], split = "\\,")))
+
+  for(t2 in namesOfLocalTeams){
+      if(!is.na(t2)){
+
+        regexList = c(paste("^y",t1,t2,dateToSearchWD,sep = "\\."),
+                    paste("^y",t2,t1,dateToSearchWD,sep = "\\.")
+                    )
+        for(regex in regexList)
+        {
+          objectiveFunction[1,grep(regex,namesOfVariables)] = reward_local
+
+        }
+      }
+    }
+  }
+
+#Dubuque
+regexList_bb_UD = c(paste("^bb","UD",baseballWeekdayRegExp,sep="\\."))
+objectiveFunction[1,grep(regexList_bb_UD,namesOfVariables)] = reward_Dubuque
+
+
+
+#Loras
+regexList_bb_LOR = c(paste("^bb","LOR","Series 4",sep="\\."))
+objectiveFunction[1,grep(regexList_bb_LOR,namesOfVariables)] = reward_Loras
+
+
+regexList_sb_LOR = c(paste("^sb","LOR","Series 1",sep="\\."))
+objectiveFunction[1,grep(regexList_sb_LOR,namesOfVariables)] = reward_Loras
+
+
+
+#Senior_weekend_soft
+for(t1 in namesOfTeams){
+  
+  DateToFindRegex = "Date (10|11)$"
+  regexList = c(paste("^y",t1,".*",DateToFindRegex,sep = "\\."))
+  objectiveFunction[1,grep(regexList,namesOfVariables)] = reward_senior_2
+
+  
+}
+
+for(t1 in namesOfTeams){
+
+  SeriesToFindRegex = "Series (7|9)"
+
+  regexList = c(paste("^x",t1,".*",SeriesToFindRegex,sep = "\\."))
+  objectiveFunction[1,grep(regexList,namesOfVariables)] = reward_senior_2
+  
+}
+
+
+#Alternate from 2025 schedule
+#Baseball
+for (i in 1:nrow(old_schedule_baseball)) {
+  
+  t2 = old_schedule_baseball[i, 2]  #Home for 2025
+  t1 = old_schedule_baseball[i, 3]  #Away for 2025
+  
+  
+  regexList = c(paste("^y",t1,t2,".*",sep = "\\."))
+  objectiveFunction[1,grep(regexList,namesOfVariables)] = reward_alternate_from_last_year
+  
+}
+
+#Softball
+for (i in 1:nrow(old_schedule_softball)) {
+  
+
+  t2 = old_schedule_softball[i, 2]  #Home for 2025
+  t1 = old_schedule_softball[i, 3]  #Away for 2025
+  
+  
+  regexList = c(paste("^x",t1,t2,".*",sep = "\\."))
+  objectiveFunction[1,grep(regexList,namesOfVariables)] = reward_alternate_from_last_year
+  
+}
+
+  
+# Set the obj function
+set.objfn(LP,objectiveFunction)
+
+# Maximization Problem
+lp.control(LP,sense='max')
+
+#Set each row of dLP individually
+for(rowCounter in 1:NROW(constraintMatrix)){
+  set.row(LP,rowCounter,constraintMatrix[rowCounter,])
+  set.constr.type(LP,inequalities[rowCounter,1],rowCounter)
+  set.rhs(LP, rightHandSide[rowCounter,1], rowCounter)
+}
+
+# COIN-OR Solve Method
+
+setwd(coinorDirectory)
+
+write.lp(LP,'arcproblem.mps',type='mps')
+
+system(paste0("cbc arcproblem.mps maxN ",maxNodes," solve solution ARCSolution.txt exit"))
+
+dataFromCoinOrCBC = data.frame(read.table(text=readLines(coinRSoltuinDir)[count.fields(coinRSoltuinDir) == 4]))
+#View(dataFromCoinOrCBC)
+dataFromCoinOrCBC
+
+dataFromCoinOrCBC = data.frame(read.table(text=readLines(coinRSoltuinDir)[count.fields(coinRSoltuinDir) == 4]))
+partialSolutionLocations = dataFromCoinOrCBC$V2
+partialSolutionValues = dataFromCoinOrCBC$V3
+partialSolutionLocations= gsub("C","",partialSolutionLocations)
+partialSolutionLocations = as.numeric(partialSolutionLocations)
+fullSolutionVector = rep(0,length(namesOfVariables))
+for(ii in 1:length(partialSolutionLocations)){
+  fullSolutionVector[partialSolutionLocations[ii]] = partialSolutionValues[ii]
+}
+names(fullSolutionVector) = namesOfVariables
+# return(fullSolutionVector)
+# }
+fullSolutionVector = as.matrix(fullSolutionVector)
+fullSolutionVector = t(fullSolutionVector)
+solutionVector = colnames(fullSolutionVector) [which(fullSolutionVector[1,] == 1)]
+
+#Solution
+#solutionVector
+
+```
+
+# Format Solution
+
+Format Solution according to Marie's specifications for A-R-C Formatting
+Since the CBC solver is in a different format, we need to translate them into readable format that ARC commissioner can use with ease.
+
+## Format Output
+
+```{r}
+
+#Formatting as requested
+#Baseball Schedule
+scheduleB = matrix("",length(dateN),length(namesOfTeams))
+row.names(scheduleB) = dateN
+colnames(scheduleB) = namesOfTeams
+for(t1 in namesOfTeams){
+  for(t2 in namesOfTeams){
+    for(d in dateN){
+      newVariable = paste("y",t1,t2,d,sep = ".")
+      numGamesRegex = paste0("^w\\.",t1,"\\.",t2,"\\.",d,"$")
+      for(variable in solutionVector){
+        if(variable == newVariable){
+          textToPrint = paste0("@ ",t1)
+          numberOfGames = fullSolutionVector[1,grep(numGamesRegex,colnames(fullSolutionVector))]
+          textToPrint = paste0(textToPrint," (",numberOfGames,")")
+          scheduleB[d,t2] = textToPrint
+        }
+      }
+      
+      newVariable = paste("y",t2,t1,d,sep = ".")
+      numGamesRegex = paste0("^w\\.",t2,"\\.",t1,"\\.",d,"$")
+      for(variable in solutionVector){
+        if(variable == newVariable){
+          textToPrint = paste0("v ",t1)
+          numberOfGames = fullSolutionVector[1,grep(numGamesRegex,colnames(fullSolutionVector))]
+          textToPrint = paste0(textToPrint," (",numberOfGames,")")
+          scheduleB[d,t2] = textToPrint
+
+            }
+      }
+      }
+
+    }
+  }
+
+row.names(scheduleB) = dateN
+
+#Softball Schedule
+scheduleS = matrix("",length(namesOfSoftballSeries),length(namesOfTeams))
+row.names(scheduleS) = namesOfSoftballSeries
+colnames(scheduleS) = namesOfTeams
+for(t1 in namesOfTeams){
+  for(t2 in namesOfTeams){
+    for(series in namesOfSoftballSeries){
+      newVariable = paste("x",t1,t2,series,sep = ".")
+      for(variable in solutionVector){
+        if(variable == newVariable){
+          scheduleS[series,t2] = paste0("@ ",t1)
+        }
+      }
+      newVariable = paste("x",t2,t1,series,sep = ".")
+      for(variable in solutionVector){
+        if(variable == newVariable){
+          scheduleS[series,t2] = paste0("v ",t1)
+        } 
+      }
+    }
+  }
+}
+row.names(scheduleS) = namesOfSoftballSeries
+
+View(scheduleS)
+View(scheduleB)
+
+baseballCSV = paste0("results/A-R-C_Baseball_Schedule.csv")
+softballCSV = paste0("results/A-R-C_Softball_Schedule.csv")
+
+write.csv(scheduleB, file = baseballCSV, row.names = TRUE)
+write.csv(scheduleS, file = softballCSV, row.names = TRUE)
+
+```
